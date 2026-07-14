@@ -1,129 +1,155 @@
-# IranLink — نصب خیلی ساده
+# IranLink Web Panel — مخصوص نودهای پاسارگارد
 
-این پروژه فقط **۳ فایل** دارد:
+این نسخه برای این سناریو ساخته شده است:
+
+```text
+کاربر → IP ایران:پورت → WireGuard → نود پاسارگارد در خارج
+```
+
+در کانفیگ کاربر فقط **IP سرور ایران** و پورتی که در پنل تعریف می‌کنی قرار می‌گیرد. خود Xray و نود پاسارگارد جابه‌جا یا داخل Network Namespace اجرا نمی‌شوند.
+
+پروژه فقط ۳ فایل دارد:
 
 - `README.md`
 - `install.sh`
 - `iranlink.sh`
 
-هر سه فایل را مستقیم در صفحه اصلی ریپوی GitHub بگذار.
+## امکانات
 
-## مرحله ۱: نصب روی سرور خارج
+- پنل وب با ورود رمزدار
+- افزودن چند سرور خارج
+- تغییر IP هر سرور خارج از داخل پنل
+- افزودن و حذف پورت TCP و UDP
+- اتصال یک پورت ایران به پورت متفاوت در خارج
+- نمایش وضعیت آنلاین یا قطع نود
+- ساخت خودکار دستور نصب نود خارج
+- WireGuard + DNAT/SNAT بدون پراکسی کاربران‌فضا
+- Kill rule برای جلوگیری از عبور پورت تعریف‌نشده
+- محدودسازی SMTP، مقصدهای خصوصی و اتصال‌های غیرعادی روی نود خارج
+- مناسب Ubuntu 22.04/24.04 و Debian 12
+
+---
+
+## مرحله ۱ — نصب پنل روی سرور ایران
+
+روی سرور ایران فقط این دستور را اجرا کن:
 
 ```bash
-sudo apt update && sudo apt install -y git
-git clone https://github.com/golb4212-design/iranlink.git
-cd iranlink
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/golb4212-design/iranlink/main/install.sh | sudo bash -s -- iran
 ```
 
-وقتی سؤال پرسید:
+نصب‌کننده این موارد را می‌پرسد:
+
+1. رمز ورود پنل
+2. IP عمومی سرور ایران
+3. پورت پنل؛ پیش‌فرض `8088`
+4. پورت WireGuard؛ پیش‌فرض `51820`
+
+بعد پنل از این آدرس باز می‌شود:
 
 ```text
-1) این سرور خارج است
-2) این سرور ایران است
+http://IP-IRAN:8088
 ```
 
-عدد `1` را بزن.
-
-در پایان دو چیز نمایش داده می‌شود:
-
-- IP سرور خارج
-- Public Key سرور خارج
-
-هر دو را کپی کن.
+دامنه و SSL اجباری نیست؛ پنل با IP باز می‌شود.
 
 ---
 
-## مرحله ۲: نصب روی سرور ایران
+## مرحله ۲ — افزودن نود پاسارگارد
 
-```bash
-sudo apt update && sudo apt install -y git
-git clone https://github.com/golb4212-design/iranlink.git
-cd iranlink
-sudo bash install.sh
-```
+داخل پنل:
 
-این بار عدد `2` را بزن و فقط این دو مورد را وارد کن:
+1. نام نود را وارد کن؛ مثلاً `Germany-1`
+2. IP سرور خارج را وارد کن
+3. روی «ساخت نود» بزن
+4. پنل یک دستور نصب آماده نمایش می‌دهد
+5. همان دستور را روی سرور خارج اجرا کن
 
-- IP سرور خارج
-- Public Key سرور خارج
-
-در پایان، نصب‌کننده یک دستور آماده می‌دهد؛ شبیه این:
-
-```bash
-sudo iranlink peer add PUBLIC_KEY_IRAN
-```
-
-همان دستور را کپی کن و **روی سرور خارج** اجرا کن.
+نود خارج خودکار به پنل ایران ثبت و متصل می‌شود. لازم نیست Public Key یا API Token را دستی کپی کنی.
 
 ---
 
-## مرحله ۳: تست روی سرور ایران
+## مرحله ۳ — افزودن پورت
 
-```bash
-sudo iranlink test
-```
+داخل بخش «افزودن پورت پاسارگارد» این موارد را انتخاب کن:
 
-اگر دیدی:
+- نود مقصد
+- TCP، UDP یا هر دو
+- پورت روی IP ایران
+- پورت واقعی نود خارج
+
+مثال:
 
 ```text
-LEAK TEST: OK
+IP ایران: 185.x.x.x
+پورت ایران: 2053
+نود خارج: Germany-1
+پورت خارج: 443
 ```
 
-تونل درست وصل شده و IP ایران نشت نمی‌کند.
+در این حالت ترافیک زیر ساخته می‌شود:
+
+```text
+185.x.x.x:2053 → Germany-1:443
+```
 
 ---
 
-## اتصال Xray به تونل
+## تنظیم کانفیگ داخل پاسارگارد
 
-روی سرور ایران:
+بعد از ساخت پورت:
 
-```bash
-sudo iranlink service attach xray.service
+- Address یا Server را روی **IP ایران** بگذار
+- Port را روی **پورت ایران** بگذار
+- UUID، Password، SNI، Host، Path، Reality Public Key و بقیه تنظیمات را تغییر نده
+
+برای نمونه، اگر پورت ایران `2053` است:
+
+```text
+Address: IP سرور ایران
+Port: 2053
+SNI/Host: همان مقدار قبلی نود خارج
 ```
 
-اگر اسم سرویس Xray متفاوت بود:
+### انتخاب پروتکل پورت
+
+- VLESS TCP، Reality، Trojan و WebSocket: معمولاً `TCP`
+- Hysteria2 و TUIC: معمولاً `UDP`
+- اگر مطمئن نیستی و پروتکل هر دو را نیاز دارد: `TCP + UDP`
+
+---
+
+## نکات مهم
+
+- سرویس Xray نود پاسارگارد بهتر است روی `0.0.0.0` گوش بدهد؛ حالت معمول پنل‌های Xray همین است.
+- یک پورت TCP روی IP ایران فقط می‌تواند به یک نود متصل شود.
+- برای نود دوم از پورت دیگری استفاده کن.
+- اگر IP سرور خارج عوض شد، از دکمه «ویرایش IP» داخل پنل استفاده کن.
+- WireGuard رمزنگاری و انتقال را در Kernel انجام می‌دهد و مصرف منابع پایین است.
+- افت سرعت مطلقاً صفر قابل تضمین نیست؛ کیفیت مسیر ایران تا خارج و توان دو سرور مؤثر است.
+
+---
+
+## بررسی سرویس‌ها
+
+روی ایران:
 
 ```bash
-systemctl list-units --type=service | grep -i xray
+systemctl status iranlink-panel
+systemctl status wg-quick@iranlink0
+journalctl -u iranlink-panel -n 100 --no-pager
 ```
 
-بعد نام درست را جای `xray.service` بگذار.
-
-## بازکردن پورت از IP ایران
-
-مثلاً پورت TCP شماره 443:
+روی خارج:
 
 ```bash
-sudo iranlink publish tcp 443
+systemctl status iranlink-agent
+systemctl status wg-quick@iranlink0
+journalctl -u iranlink-agent -n 100 --no-pager
 ```
 
-برای UDP:
+## آدرس GitHub
 
-```bash
-sudo iranlink publish udp 443
+```text
+https://github.com/golb4212-design/iranlink
 ```
-
-## دستورهای کاربردی
-
-```bash
-sudo iranlink status
-sudo iranlink test
-sudo iranlink restart
-sudo iranlink logs
-sudo iranlink show-key
-```
-
-## حذف کامل
-
-```bash
-sudo iranlink uninstall
-```
-
-## نکته مهم
-
-- ترافیک سرویس متصل‌شده داخل Network Namespace جدا اجرا می‌شود.
-- اگر تونل قطع شود، Kill Switch اجازه خروج ترافیک خام از IP ایران را نمی‌دهد.
-- مقصدهای خصوصی، SMTP مستقیم و تعداد غیرعادی اتصال‌های جدید در سرور خارج محدود می‌شوند.
-- هیچ تونلی افت سرعت کاملاً صفر را تضمین نمی‌کند؛ کیفیت دو سرور و مسیر شبکه مهم است.

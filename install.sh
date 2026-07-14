@@ -1,157 +1,187 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO="https://github.com/golb4212-design/iranlink"
-DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-CONFIG_DIR="/etc/iranlink"
-CONFIG_FILE="$CONFIG_DIR/config.env"
-BIN_PATH="/usr/local/sbin/iranlink"
-SERVICE_FILE="/etc/systemd/system/iranlink.service"
+REPO_RAW="https://raw.githubusercontent.com/golb4212-design/iranlink/main"
+APP_DIR="/opt/iranlink"
+VENV="$APP_DIR/venv"
+APP="$APP_DIR/app.py"
+WG_IF="iranlink0"
+ROLE="${1:-}"
+shift || true
+PANEL_URL=""
+BOOTSTRAP=""
+PUBLIC_IP=""
+PANEL_PORT="8088"
+WG_PORT="51820"
+MTU="1380"
+ADMIN_PASSWORD=""
 
-blue() { printf '\033[1;34m%s\033[0m\n' "$*"; }
-red() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
-[[ ${EUID:-$(id -u)} -eq 0 ]] || red "این دستور را با sudo اجرا کن."
-[[ -f "$DIR/iranlink.sh" ]] || red "فایل iranlink.sh کنار install.sh نیست. هر سه فایل را در صفحه اصلی GitHub بگذار."
+blue(){ printf '\033[1;34m%s\033[0m\n' "$*"; }
+green(){ printf '\033[1;32m%s\033[0m\n' "$*"; }
+red(){ printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
+[[ ${EUID:-$(id -u)} -eq 0 ]] || red "دستور را با sudo یا root اجرا کن."
 
-clear 2>/dev/null || true
-blue "================================="
-blue "       نصب ساده IranLink"
-blue "================================="
-echo "1) این سرور خارج است"
-echo "2) این سرور ایران است"
-read -rp "عدد 1 یا 2: " CHOICE
-[[ $CHOICE == 1 || $CHOICE == 2 ]] || red "فقط 1 یا 2 وارد کن."
+while (($#)); do
+  case "$1" in
+    --panel-url) PANEL_URL="${2:-}"; shift 2 ;;
+    --bootstrap) BOOTSTRAP="${2:-}"; shift 2 ;;
+    --public-ip) PUBLIC_IP="${2:-}"; shift 2 ;;
+    --panel-port) PANEL_PORT="${2:-}"; shift 2 ;;
+    --wg-port) WG_PORT="${2:-}"; shift 2 ;;
+    --mtu) MTU="${2:-}"; shift 2 ;;
+    --password) ADMIN_PASSWORD="${2:-}"; shift 2 ;;
+    *) red "گزینه ناشناخته: $1" ;;
+  esac
+done
 
-read -rp "پورت WireGuard [51820]: " WG_PORT
-WG_PORT=${WG_PORT:-51820}
-[[ $WG_PORT =~ ^[0-9]+$ ]] && ((WG_PORT>=1 && WG_PORT<=65535)) || red "پورت نامعتبر است."
-read -rp "MTU [1380]: " MTU
-MTU=${MTU:-1380}
-[[ $MTU =~ ^[0-9]+$ ]] && ((MTU>=1280 && MTU<=1420)) || red "MTU باید بین 1280 و 1420 باشد."
+if [[ -z "$ROLE" ]]; then
+  echo "1) نصب پنل روی سرور ایران"
+  echo "2) نصب نود روی سرور خارج"
+  read -rp "انتخاب: " choice
+  [[ "$choice" == 1 ]] && ROLE="iran"
+  [[ "$choice" == 2 ]] && ROLE="foreign"
+fi
+[[ "$ROLE" == "iran" || "$ROLE" == "foreign" ]] || red "نقش باید iran یا foreign باشد."
 
-EXIT_IP=""; EXIT_KEY=""; DNS_SERVER="1.1.1.1"
-if [[ $CHOICE == 2 ]]; then
-  read -rp "IP سرور خارج: " EXIT_IP
-  [[ $EXIT_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || red "IP نامعتبر است."
-  read -rp "Public Key سرور خارج: " EXIT_KEY
-  [[ ${#EXIT_KEY} -eq 44 ]] || red "Public Key نامعتبر است."
+if ! command -v apt-get >/dev/null 2>&1; then
+  red "این نسخه برای Ubuntu 22.04/24.04 و Debian 12 ساخته شده است."
 fi
 
+blue "نصب بسته‌های لازم..."
 export DEBIAN_FRONTEND=noninteractive
-if command -v apt-get >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y --no-install-recommends wireguard-tools nftables iproute2 iputils-ping curl ca-certificates procps
-elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y wireguard-tools nftables iproute iputils curl ca-certificates procps-ng
-elif command -v yum >/dev/null 2>&1; then
-  yum install -y epel-release || true
-  yum install -y wireguard-tools nftables iproute iputils curl ca-certificates procps-ng
+apt-get update -y
+apt-get install -y --no-install-recommends wireguard-tools nftables python3 python3-venv python3-pip curl ca-certificates iproute2 jq
+
+install -d -m 755 "$APP_DIR" /etc/iranlink /etc/wireguard
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/iranlink.sh" ]]; then
+  install -m 755 "$SCRIPT_DIR/iranlink.sh" "$APP"
 else
-  red "فقط Ubuntu/Debian و AlmaLinux/Rocky پشتیبانی می‌شوند."
+  curl -fsSL "$REPO_RAW/iranlink.sh" -o "$APP"
+  chmod 755 "$APP"
 fi
 
-command -v wg >/dev/null || red "WireGuard نصب نشد."
-command -v nft >/dev/null || red "nftables نصب نشد."
-WAN_IF=$(ip -4 route show default | awk 'NR==1{print $5}')
-[[ -n $WAN_IF ]] || red "کارت شبکه اینترنت پیدا نشد."
-
-systemctl stop iranlink.service 2>/dev/null || true
-install -d -m 700 "$CONFIG_DIR"
-install -m 755 "$DIR/iranlink.sh" "$BIN_PATH"
-
-if [[ ! -s "$CONFIG_DIR/private.key" ]]; then
-  umask 077
-  wg genkey | tee "$CONFIG_DIR/private.key" | wg pubkey > "$CONFIG_DIR/public.key"
+if [[ ! -x "$VENV/bin/python" ]]; then
+  python3 -m venv "$VENV"
 fi
-chmod 600 "$CONFIG_DIR/private.key"
-chmod 644 "$CONFIG_DIR/public.key"
-touch "$CONFIG_DIR/ports.conf" "$CONFIG_DIR/services.conf" "$CONFIG_DIR/ufw-managed.conf"
-chmod 600 "$CONFIG_DIR/ports.conf" "$CONFIG_DIR/services.conf" "$CONFIG_DIR/ufw-managed.conf"
+"$VENV/bin/pip" install --disable-pip-version-check --no-cache-dir -q --upgrade pip
+"$VENV/bin/pip" install --disable-pip-version-check --no-cache-dir -q flask gunicorn
 
-cat > /etc/sysctl.d/99-iranlink.conf <<'EOF'
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-net.ipv4.conf.all.src_valid_mark = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.tcp_syncookies = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.netdev_max_backlog = 16384
+cat >/etc/sysctl.d/99-iranlink.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.tcp_syncookies=1
+net.core.default_qdisc=fq
 EOF
-
 if modprobe tcp_bbr 2>/dev/null && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-  cat > /etc/sysctl.d/99-iranlink-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
+  echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/99-iranlink.conf
 fi
 sysctl --system >/dev/null
 
-if [[ $CHOICE == 1 ]]; then
-  cat > "$CONFIG_FILE" <<EOF
-ROLE=exit
-WAN_IF=$WAN_IF
-WG_PORT=$WG_PORT
-MTU=$MTU
-EOF
-else
-  printf '%s\n' "$EXIT_KEY" > "$CONFIG_DIR/peer.pub"
-  chmod 600 "$CONFIG_DIR/peer.pub"
-  cat > "$CONFIG_FILE" <<EOF
-ROLE=iran
-WAN_IF=$WAN_IF
-WG_PORT=$WG_PORT
-MTU=$MTU
-EXIT_IP=$EXIT_IP
-DNS_SERVER=$DNS_SERVER
-EOF
-fi
-chmod 600 "$CONFIG_FILE"
+if [[ "$ROLE" == "iran" ]]; then
+  if [[ -z "$ADMIN_PASSWORD" ]]; then
+    while :; do
+      read -rsp "رمز ورود پنل (حداقل 8 کاراکتر): " ADMIN_PASSWORD; echo
+      [[ ${#ADMIN_PASSWORD} -ge 8 ]] && break
+      echo "رمز کوتاه است."
+    done
+  fi
+  if [[ -z "$PUBLIC_IP" ]]; then
+    PUBLIC_IP="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    read -rp "IP عمومی سرور ایران [${PUBLIC_IP:-وارد کن}]: " typed
+    PUBLIC_IP="${typed:-$PUBLIC_IP}"
+  fi
+  read -rp "پورت پنل وب [$PANEL_PORT]: " typed; PANEL_PORT="${typed:-$PANEL_PORT}"
+  read -rp "پورت WireGuard [$WG_PORT]: " typed; WG_PORT="${typed:-$WG_PORT}"
 
-cat > "$SERVICE_FILE" <<'EOF'
+  blue "ساخت پنل ایران..."
+  "$VENV/bin/python" "$APP" init-panel \
+    --public-ip "$PUBLIC_IP" \
+    --panel-port "$PANEL_PORT" \
+    --wg-port "$WG_PORT" \
+    --mtu "$MTU" \
+    --admin-password "$ADMIN_PASSWORD"
+
+  cat >/etc/systemd/system/iranlink-panel.service <<EOF
 [Unit]
-Description=IranLink isolated WireGuard tunnel
-After=network-online.target
+Description=IranLink web panel for Pasargad nodes
+After=network-online.target wg-quick@${WG_IF}.service
 Wants=network-online.target
+Requires=wg-quick@${WG_IF}.service
+
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/iranlink internal-up
-ExecStop=/usr/local/sbin/iranlink internal-down
-TimeoutStartSec=45
-TimeoutStopSec=20
+Type=simple
+WorkingDirectory=$APP_DIR
+Environment=IRANLINK_MODE=panel
+ExecStartPre=$VENV/bin/python $APP apply-panel
+ExecStart=$VENV/bin/gunicorn --workers 1 --threads 4 --timeout 30 --bind 0.0.0.0:$PANEL_PORT --access-logfile - --error-logfile - app:app
+Restart=always
+RestartSec=3
+NoNewPrivileges=false
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now iranlink.service
+  systemctl daemon-reload
+  systemctl enable --now "wg-quick@${WG_IF}.service"
+  systemctl enable --now iranlink-panel.service
 
-PUBLIC_KEY=$(cat "$CONFIG_DIR/public.key")
-PUBLIC_IP=$(curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
-echo
-blue "نصب تمام شد ✅"
-echo "Public Key این سرور:"
-echo "$PUBLIC_KEY"
-echo
-if [[ $CHOICE == 1 ]]; then
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow "${WG_PORT}/udp" comment 'IranLink WireGuard' >/dev/null
-    grep -Fxq "exit-input|$WG_PORT" "$CONFIG_DIR/ufw-managed.conf" || echo "exit-input|$WG_PORT" >> "$CONFIG_DIR/ufw-managed.conf"
-    ufw route allow in on ilwg0 out on "$WAN_IF" >/dev/null || true
-    grep -Fxq "exit-route|$WAN_IF" "$CONFIG_DIR/ufw-managed.conf" || echo "exit-route|$WAN_IF" >> "$CONFIG_DIR/ufw-managed.conf"
+    ufw allow "${PANEL_PORT}/tcp" comment 'IranLink-Panel' >/dev/null || true
+    ufw allow "${WG_PORT}/udp" comment 'IranLink-WG' >/dev/null || true
   fi
-  echo "این دو مورد را برای نصب ایران نگه دار:"
-  echo "IP خارج: ${PUBLIC_IP:-IP_SERVER_KHAREJ}"
-  echo "Public Key خارج: $PUBLIC_KEY"
-else
-  echo "حالا این دستور را روی سرور خارج بزن:"
-  echo "sudo iranlink peer add $PUBLIC_KEY"
+
+  green "پنل نصب شد ✅"
   echo
-  echo "بعد روی همین سرور ایران تست بگیر:"
-  echo "sudo iranlink test"
+  echo "آدرس پنل: http://$PUBLIC_IP:$PANEL_PORT"
+  echo "از داخل پنل نود خارج را بساز و دستور آماده نصب را کپی کن."
+
+else
+  if [[ -z "$PANEL_URL" ]]; then read -rp "آدرس پنل ایران، مثل http://1.2.3.4:8088: " PANEL_URL; fi
+  if [[ -z "$BOOTSTRAP" ]]; then read -rp "کد نصب نود که پنل داده: " BOOTSTRAP; fi
+  [[ -n "$PANEL_URL" && -n "$BOOTSTRAP" ]] || red "آدرس پنل و کد نصب لازم است."
+
+  blue "دریافت مشخصات نود از پنل ایران..."
+  "$VENV/bin/python" "$APP" init-agent --panel-url "$PANEL_URL" --bootstrap "$BOOTSTRAP"
+  TUNNEL_IP="$(jq -r '.tunnel_ip' /etc/iranlink/agent.json)"
+  FOREIGN_WG_PORT="$(jq -r '.foreign_wg_port' /etc/iranlink/agent.json)"
+
+  cat >/etc/systemd/system/iranlink-agent.service <<EOF
+[Unit]
+Description=IranLink foreign node agent
+After=network-online.target wg-quick@${WG_IF}.service
+Wants=network-online.target
+Requires=wg-quick@${WG_IF}.service
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+Environment=IRANLINK_MODE=agent
+ExecStartPre=$VENV/bin/python $APP apply-agent
+ExecStart=$VENV/bin/gunicorn --workers 1 --threads 2 --timeout 30 --bind $TUNNEL_IP:9700 --access-logfile - --error-logfile - app:app
+Restart=always
+RestartSec=3
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "wg-quick@${WG_IF}.service"
+  systemctl enable --now iranlink-agent.service
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${FOREIGN_WG_PORT}/udp" comment 'IranLink-WG' >/dev/null || true
+    ufw allow in on "$WG_IF" from 10.88.0.1 comment 'IranLink-Agent' >/dev/null || true
+  fi
+
+  green "نود خارج نصب و به پنل ایران متصل شد ✅"
+  echo "حالا از پنل ایران پورت‌های پاسارگارد را اضافه کن."
 fi

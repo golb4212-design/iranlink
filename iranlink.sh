@@ -1,401 +1,911 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/usr/bin/env python3
+import argparse
+import base64
+import contextlib
+import concurrent.futures
+import datetime as dt
+import functools
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
-VERSION="1.1.0"
-CONFIG_DIR="/etc/iranlink"
-CONFIG_FILE="$CONFIG_DIR/config.env"
-PORTS_FILE="$CONFIG_DIR/ports.conf"
-SERVICES_FILE="$CONFIG_DIR/services.conf"
-UFW_STATE_FILE="$CONFIG_DIR/ufw-managed.conf"
-PRIVATE_KEY_FILE="$CONFIG_DIR/private.key"
-PUBLIC_KEY_FILE="$CONFIG_DIR/public.key"
-PEER_KEY_FILE="$CONFIG_DIR/peer.pub"
-SERVICE_FILE="/etc/systemd/system/iranlink.service"
-BIN_PATH="/usr/local/sbin/iranlink"
-NETNS_NAME="iranlink"
-WG_IF="ilwg0"
-VETH_HOST="il-host"
-VETH_NS="il-ns"
-VETH_HOST_ADDR="10.203.0.1/30"
-VETH_NS_ADDR="10.203.0.2/30"
-VETH_NS_IP="10.203.0.2"
-WG_EXIT_ADDR="10.66.66.1/30"
-WG_IRAN_ADDR="10.66.66.2/30"
-WG_IRAN_IP="10.66.66.2"
+from flask import Flask, abort, flash, jsonify, redirect, render_template_string, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
-log()  { printf '\033[1;34m[IranLink]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[IranLink]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[IranLink]\033[0m %s\n' "$*" >&2; exit 1; }
-require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "این دستور باید با sudo یا root اجرا شود."; }
-command_exists() { command -v "$1" >/dev/null 2>&1; }
-load_config() { [[ -r "$CONFIG_FILE" ]] || die "IranLink هنوز نصب نشده است."; source "$CONFIG_FILE"; }
-validate_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
-validate_ipv4() {
-  local ip=${1:-} x
-  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS=. read -r -a parts <<< "$ip"
-  for x in "${parts[@]}"; do ((10#$x >= 0 && 10#$x <= 255)) || return 1; done
-}
-validate_wg_key() { local key=${1:-}; [[ ${#key} -eq 44 && $key =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
-detect_public_ipv4() {
-  local ip=""
-  command_exists curl && ip=$(curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
-  if validate_ipv4 "$ip"; then printf '%s\n' "$ip"; else ip -4 addr show scope global | awk '/inet / {sub(/\/.*/,"",$2); print $2; exit}'; fi
-}
-restart_service() { systemctl daemon-reload; systemctl restart iranlink.service; }
+VERSION = "2.0.0"
+BASE = Path("/etc/iranlink")
+DB_PATH = BASE / "iranlink.db"
+SETTINGS_PATH = BASE / "settings.json"
+AGENT_PATH = BASE / "agent.json"
+PORTS_CACHE = BASE / "agent-ports.json"
+PRIVATE_KEY = BASE / "private.key"
+PUBLIC_KEY = BASE / "public.key"
+WG_CONF = Path("/etc/wireguard/iranlink.conf")
+WG_IF = "iranlink0"
+PANEL_TUNNEL_IP = "10.88.0.1"
+AGENT_PORT = 9700
+TABLE_FILTER = "iranlink_filter"
+TABLE_NAT = "iranlink_nat"
+TABLE_AGENT = "iranlink_agent"
+LOCK = threading.RLock()
 
-ufw_active() { command_exists ufw && ufw status 2>/dev/null | grep -q '^Status: active'; }
-ufw_state_add() { touch "$UFW_STATE_FILE"; chmod 600 "$UFW_STATE_FILE"; grep -Fxq -- "$1" "$UFW_STATE_FILE" || echo "$1" >> "$UFW_STATE_FILE"; }
-ufw_state_remove() {
-  [[ -f "$UFW_STATE_FILE" ]] || return 0
-  local t; t=$(mktemp); grep -Fvx -- "$1" "$UFW_STATE_FILE" > "$t" || true; install -m 600 "$t" "$UFW_STATE_FILE"; rm -f "$t"
-}
-ufw_allow_exit() {
-  ufw_active || return 0
-  local p=$1 wan=$2
-  if ! ufw show added 2>/dev/null | grep -Fq "ufw allow ${p}/udp"; then ufw allow "${p}/udp" comment 'IranLink WireGuard' >/dev/null; ufw_state_add "exit-input|$p"; fi
-  if ! ufw show added 2>/dev/null | grep -Fq "ufw route allow in on $WG_IF out on $wan"; then ufw route allow in on "$WG_IF" out on "$wan" >/dev/null; ufw_state_add "exit-route|$wan"; fi
-}
-ufw_add_publish() {
-  ufw_active || return 0
-  local proto=$1 hp=$2 tp=$3 wan=$4
-  if ! ufw show added 2>/dev/null | grep -Fq "ufw allow ${hp}/${proto}"; then ufw allow "${hp}/${proto}" comment 'IranLink port' >/dev/null; ufw_state_add "publish-input|$proto|$hp"; fi
-  if ! ufw show added 2>/dev/null | grep -Fq "ufw route allow in on $wan out on $VETH_HOST to $VETH_NS_IP port $tp proto $proto"; then
-    ufw route allow in on "$wan" out on "$VETH_HOST" to "$VETH_NS_IP" port "$tp" proto "$proto" >/dev/null
-    ufw_state_add "publish-route|$proto|$tp|$wan"
-  fi
-}
-ufw_remove_publish() {
-  command_exists ufw || return 0
-  local proto=$1 hp=$2 tp=$3 wan=$4 remove_input=${5:-1} remove_route=${6:-1} key
-  key="publish-input|$proto|$hp"
-  if [[ $remove_input == 1 ]] && grep -Fxq "$key" "$UFW_STATE_FILE" 2>/dev/null; then ufw --force delete allow "${hp}/${proto}" >/dev/null 2>&1 || true; ufw_state_remove "$key"; fi
-  key="publish-route|$proto|$tp|$wan"
-  if [[ $remove_route == 1 ]] && grep -Fxq "$key" "$UFW_STATE_FILE" 2>/dev/null; then ufw --force route delete allow in on "$wan" out on "$VETH_HOST" to "$VETH_NS_IP" port "$tp" proto "$proto" >/dev/null 2>&1 || true; ufw_state_remove "$key"; fi
-}
-ufw_cleanup() {
-  command_exists ufw || return 0
-  [[ -s "$UFW_STATE_FILE" ]] || return 0
-  local kind a b c
-  while IFS='|' read -r kind a b c; do
-    case "$kind" in
-      exit-input) ufw --force delete allow "${a}/udp" >/dev/null 2>&1 || true ;;
-      exit-route) ufw --force route delete allow in on "$WG_IF" out on "$a" >/dev/null 2>&1 || true ;;
-      publish-input) ufw --force delete allow "${b}/${a}" >/dev/null 2>&1 || true ;;
-      publish-route) ufw --force route delete allow in on "$c" out on "$VETH_HOST" to "$VETH_NS_IP" port "$b" proto "$a" >/dev/null 2>&1 || true ;;
-    esac
-  done < "$UFW_STATE_FILE"
-  : > "$UFW_STATE_FILE"
-}
 
-render_exit_nft() {
-  cat <<NFT
-table inet iranlink_exit_filter {
-  set blocked_v4 {
+def run(cmd, check=True, capture=True, input_text=None):
+    kwargs = {
+        "text": True,
+        "check": check,
+        "input": input_text,
+    }
+    if capture:
+        kwargs.update({"stdout": subprocess.PIPE, "stderr": subprocess.PIPE})
+    return subprocess.run(cmd, **kwargs)
+
+
+def atomic_write(path: Path, data: str, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def load_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {} if default is None else default
+
+
+def save_json(path: Path, value, mode=0o600):
+    atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n", mode)
+
+
+def valid_ip(value):
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def valid_port(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if 1 <= n <= 65535 else None
+
+
+def valid_wg_key(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9+/]{43}=", value):
+        return False
+    try:
+        return len(base64.b64decode(value, validate=True)) == 32
+    except Exception:
+        return False
+
+
+def detect_wan_if():
+    result = run(["ip", "-4", "route", "show", "default"], capture=True)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            return parts[parts.index("dev") + 1]
+    raise RuntimeError("کارت شبکه اینترنت پیدا نشد")
+
+
+def detect_public_ip():
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(url, timeout=6) as r:
+                ip = r.read(100).decode().strip()
+            if valid_ip(ip):
+                return ip
+        except Exception:
+            pass
+    result = run(["ip", "-4", "addr", "show", "scope", "global"], capture=True, check=False)
+    for token in result.stdout.split():
+        if "/" in token:
+            ip = token.split("/", 1)[0]
+            if valid_ip(ip):
+                return ip
+    return ""
+
+
+def ensure_keys():
+    BASE.mkdir(parents=True, exist_ok=True)
+    if PRIVATE_KEY.exists() and PUBLIC_KEY.exists():
+        return
+    private = run(["wg", "genkey"]).stdout.strip()
+    public = run(["wg", "pubkey"], input_text=private + "\n").stdout.strip()
+    atomic_write(PRIVATE_KEY, private + "\n", 0o600)
+    atomic_write(PUBLIC_KEY, public + "\n", 0o644)
+
+
+def nft_apply(script: str):
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+        f.write(script)
+        name = f.name
+    try:
+        run(["nft", "-c", "-f", name])
+        run(["nft", "-f", name])
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
+def nft_delete_table(family, name):
+    run(["nft", "delete", "table", family, name], check=False)
+
+
+def ufw_active():
+    if not shutil.which("ufw"):
+        return False
+    r = run(["ufw", "status"], check=False)
+    return "Status: active" in r.stdout
+
+
+def ufw_add_panel_rules(wan_if, wg_port, panel_port):
+    if not ufw_active():
+        return
+    run(["ufw", "allow", f"{wg_port}/udp", "comment", "IranLink-WG"], check=False)
+    run(["ufw", "allow", f"{panel_port}/tcp", "comment", "IranLink-Panel"], check=False)
+    run(["ufw", "route", "allow", "in", "on", wan_if, "out", "on", WG_IF], check=False)
+
+
+def ufw_add_agent_rules():
+    if not ufw_active():
+        return
+    run(["ufw", "allow", "in", "on", WG_IF, "from", PANEL_TUNNEL_IP, "comment", "IranLink-Agent"], check=False)
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    BASE.mkdir(parents=True, exist_ok=True)
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              endpoint_ip TEXT,
+              endpoint_port INTEGER NOT NULL DEFAULT 51820,
+              tunnel_ip TEXT NOT NULL UNIQUE,
+              public_key TEXT,
+              agent_token TEXT,
+              bootstrap_token TEXT NOT NULL UNIQUE,
+              registered INTEGER NOT NULL DEFAULT 0,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              last_seen INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ports (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+              protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp')),
+              public_port INTEGER NOT NULL,
+              target_port INTEGER NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at INTEGER NOT NULL,
+              UNIQUE(protocol, public_port)
+            );
+            """
+        )
+
+
+def panel_settings():
+    value = load_json(SETTINGS_PATH)
+    if value.get("role") != "iran":
+        raise RuntimeError("این سرور به‌عنوان پنل ایران نصب نشده است")
+    return value
+
+
+def agent_settings():
+    value = load_json(AGENT_PATH)
+    if value.get("role") != "foreign":
+        raise RuntimeError("این سرور به‌عنوان نود خارج نصب نشده است")
+    return value
+
+
+def allocate_tunnel_ip(conn):
+    used = {row[0] for row in conn.execute("SELECT tunnel_ip FROM nodes")}
+    for x in range(2, 255):
+        candidate = f"10.88.0.{x}"
+        if candidate not in used:
+            return candidate
+    raise RuntimeError("ظرفیت آدرس تونل پر شده است")
+
+
+def render_panel_wg():
+    settings = panel_settings()
+    ensure_keys()
+    lines = [
+        "[Interface]",
+        f"Address = {PANEL_TUNNEL_IP}/24",
+        f"ListenPort = {settings['wg_port']}",
+        f"PrivateKey = {PRIVATE_KEY.read_text().strip()}",
+        f"MTU = {settings['mtu']}",
+        "SaveConfig = false",
+        "",
+    ]
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE enabled=1 AND registered=1 ORDER BY id"
+        ).fetchall()
+    for node in rows:
+        lines.extend(
+            [
+                "[Peer]",
+                f"# {node['name']}",
+                f"PublicKey = {node['public_key']}",
+                f"AllowedIPs = {node['tunnel_ip']}/32",
+                f"Endpoint = {node['endpoint_ip']}:{node['endpoint_port']}",
+                "PersistentKeepalive = 25",
+                "",
+            ]
+        )
+    atomic_write(WG_CONF, "\n".join(lines), 0o600)
+
+
+def sync_wg():
+    render_panel_wg()
+    if run(["ip", "link", "show", WG_IF], check=False).returncode != 0:
+        run(["systemctl", "restart", f"wg-quick@{WG_IF}.service"])
+        return
+    stripped = run(["wg-quick", "strip", str(WG_CONF)]).stdout
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+        f.write(stripped)
+        name = f.name
+    try:
+        run(["wg", "syncconf", WG_IF, name])
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
+def panel_rules_script():
+    settings = panel_settings()
+    wan = settings["wan_if"]
+    wg_port = int(settings["wg_port"])
+    panel_port = int(settings["panel_port"])
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, n.tunnel_ip
+            FROM ports p JOIN nodes n ON n.id=p.node_id
+            WHERE p.enabled=1 AND n.enabled=1 AND n.registered=1
+            ORDER BY p.id
+            """
+        ).fetchall()
+    filter_rules = []
+    nat_pre = []
+    nat_post = []
+    for p in rows:
+        proto = p["protocol"]
+        ip = p["tunnel_ip"]
+        public_port = p["public_port"]
+        target_port = p["target_port"]
+        filter_rules.append(
+            f'    iifname "{wan}" oifname "{WG_IF}" ip daddr {ip} {proto} dport {target_port} accept'
+        )
+        nat_pre.append(
+            f'    iifname "{wan}" {proto} dport {public_port} dnat to {ip}:{target_port}'
+        )
+        nat_post.append(
+            f'    oifname "{WG_IF}" ip daddr {ip} {proto} dport {target_port} masquerade'
+        )
+    return f"""
+flush table inet {TABLE_FILTER}
+flush table ip {TABLE_NAT}
+table inet {TABLE_FILTER} {{
+  chain input_guard {{
+    type filter hook input priority -50; policy accept;
+    ct state invalid drop
+    iifname \"{wan}\" udp dport {wg_port} accept
+    iifname \"{wan}\" tcp dport {panel_port} accept
+  }}
+  chain forward_guard {{
+    type filter hook forward priority -50; policy accept;
+    ct state invalid drop
+    ct state established,related accept
+{os.linesep.join(filter_rules)}
+    iifname \"{wan}\" oifname \"{WG_IF}\" drop
+    iifname \"{WG_IF}\" oifname \"{wan}\" ct state established,related accept
+  }}
+}}
+table ip {TABLE_NAT} {{
+  chain prerouting {{
+    type nat hook prerouting priority dstnat; policy accept;
+{os.linesep.join(nat_pre)}
+  }}
+  chain postrouting {{
+    type nat hook postrouting priority srcnat; policy accept;
+{os.linesep.join(nat_post)}
+  }}
+}}
+"""
+
+
+def apply_panel_rules():
+    with LOCK:
+        nft_delete_table("inet", TABLE_FILTER)
+        nft_delete_table("ip", TABLE_NAT)
+        script = panel_rules_script().replace(f"flush table inet {TABLE_FILTER}\n", "").replace(
+            f"flush table ip {TABLE_NAT}\n", ""
+        )
+        nft_apply(script)
+        settings = panel_settings()
+        ufw_add_panel_rules(settings["wan_if"], settings["wg_port"], settings["panel_port"])
+
+
+def render_agent_wg(data):
+    ensure_keys()
+    content = f"""[Interface]
+Address = {data['tunnel_ip']}/32
+ListenPort = {data['foreign_wg_port']}
+PrivateKey = {PRIVATE_KEY.read_text().strip()}
+MTU = {data['mtu']}
+SaveConfig = false
+
+[Peer]
+PublicKey = {data['panel_public_key']}
+AllowedIPs = {PANEL_TUNNEL_IP}/32
+Endpoint = {data['iran_ip']}:{data['iran_wg_port']}
+PersistentKeepalive = 25
+"""
+    atomic_write(WG_CONF, content, 0o600)
+
+
+def agent_rules_script(ports):
+    settings = agent_settings()
+    wan = settings["wan_if"]
+    tcp = sorted({int(x) for x in ports.get("tcp", []) if valid_port(x)})
+    udp = sorted({int(x) for x in ports.get("udp", []) if valid_port(x)})
+    tcp_rule = f"    iifname \"{WG_IF}\" ip saddr {PANEL_TUNNEL_IP} tcp dport {{ {', '.join(map(str, tcp))} }} accept" if tcp else ""
+    udp_rule = f"    iifname \"{WG_IF}\" ip saddr {PANEL_TUNNEL_IP} udp dport {{ {', '.join(map(str, udp))} }} accept" if udp else ""
+    return f"""
+table inet {TABLE_AGENT} {{
+  set blocked_v4 {{
     type ipv4_addr
     flags interval
-    elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+    elements = {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
                  169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24,
                  192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15,
-                 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 }
-  }
-  chain input_guard {
-    type filter hook input priority -5; policy accept;
-    iifname "$WAN_IF" udp dport $WG_PORT accept
-  }
-  chain forward_guard {
-    type filter hook forward priority -5; policy accept;
+                 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 }}
+  }}
+  chain input_guard {{
+    type filter hook input priority -60; policy accept;
     ct state invalid drop
     ct state established,related accept
-    iifname "$WG_IF" oifname "$WAN_IF" ip daddr @blocked_v4 drop
-    iifname "$WG_IF" oifname "$WAN_IF" tcp dport 25 drop
-    iifname "$WG_IF" oifname "$WAN_IF" ct state new tcp flags syn limit rate over 350/second burst 700 packets drop
-    iifname "$WG_IF" oifname "$WAN_IF" ct state new meta l4proto udp limit rate over 900/second burst 1800 packets drop
-    iifname "$WG_IF" oifname "$WAN_IF" accept
-    iifname "$WAN_IF" oifname "$WG_IF" ct state established,related accept
-  }
-}
-table ip iranlink_exit_nat {
-  chain postrouting {
-    type nat hook postrouting priority srcnat; policy accept;
-    oifname "$WAN_IF" ip saddr $WG_IRAN_IP masquerade
-  }
-}
-NFT
-}
+    iifname \"{WG_IF}\" ip saddr {PANEL_TUNNEL_IP} tcp dport {AGENT_PORT} accept
+{tcp_rule}
+{udp_rule}
+    iifname \"{WG_IF}\" drop
+  }}
+  chain output_guard {{
+    type filter hook output priority -60; policy accept;
+    oifname \"{wan}\" ip daddr @blocked_v4 drop
+    oifname \"{wan}\" tcp dport 25 drop
+    oifname \"{wan}\" ct state new tcp flags syn limit rate over 500/second burst 1000 packets drop
+    oifname \"{wan}\" ct state new meta l4proto udp limit rate over 1200/second burst 2400 packets drop
+  }}
+}}
+"""
 
-render_iran_host_nft() {
-  cat <<NFT
-table inet iranlink_iran_filter {
-  chain forward_guard {
-    type filter hook forward priority -5; policy accept;
-    ct state invalid drop
-    ct state established,related accept
-    iifname "$VETH_HOST" oifname "$WAN_IF" ip saddr $VETH_NS_IP drop
-  }
-}
-table ip iranlink_iran_nat {
-  chain prerouting {
-    type nat hook prerouting priority dstnat; policy accept;
-NFT
-  if [[ -s "$PORTS_FILE" ]]; then
-    while read -r proto hp tp; do
-      [[ -n ${proto:-} && ${proto:0:1} != '#' ]] || continue
-      [[ $proto == tcp ]] && echo "    iifname \"$WAN_IF\" tcp dport $hp dnat to $VETH_NS_IP:$tp"
-      [[ $proto == udp ]] && echo "    iifname \"$WAN_IF\" udp dport $hp dnat to $VETH_NS_IP:$tp"
-    done < "$PORTS_FILE"
-  fi
-  cat <<'NFT'
-  }
-}
-NFT
-}
 
-render_iran_ns_nft() {
-  cat <<NFT
-table inet iranlink_ns_filter {
-  chain preroute_mark {
-    type filter hook prerouting priority mangle; policy accept;
-    iifname "$VETH_NS" ct state new ct mark set 0x1
-    ct mark 0x1 meta mark set ct mark
-  }
-  chain input_guard {
-    type filter hook input priority filter; policy drop;
-    iifname "lo" accept
-    ct state invalid drop
-    ct state established,related accept
-    iifname "$VETH_NS" accept
-  }
-  chain output_guard {
-    type filter hook output priority filter; policy drop;
-    oifname "lo" accept
-    ct state invalid drop
-    ct state established,related accept
-    oifname "$WG_IF" accept
-    oifname "$VETH_NS" meta mark 0x1 accept
-  }
-}
-table ip iranlink_ns_route {
-  chain output_mark {
-    type route hook output priority mangle; policy accept;
-    ct mark 0x1 meta mark set ct mark
-  }
-}
-NFT
-}
+def apply_agent_rules(ports=None):
+    with LOCK:
+        if ports is None:
+            ports = load_json(PORTS_CACHE, {"tcp": [], "udp": []})
+        clean = {
+            "tcp": sorted({valid_port(x) for x in ports.get("tcp", []) if valid_port(x)}),
+            "udp": sorted({valid_port(x) for x in ports.get("udp", []) if valid_port(x)}),
+        }
+        save_json(PORTS_CACHE, clean)
+        nft_delete_table("inet", TABLE_AGENT)
+        nft_apply(agent_rules_script(clean))
+        ufw_add_agent_rules()
 
-nft_load_host() { local f; f=$(mktemp); "$1" > "$f"; nft -c -f "$f"; nft -f "$f"; rm -f "$f"; }
-nft_load_ns() { local f; f=$(mktemp); "$1" > "$f"; ip netns exec "$NETNS_NAME" nft -c -f "$f"; ip netns exec "$NETNS_NAME" nft -f "$f"; rm -f "$f"; }
 
-internal_down() {
-  [[ -r "$CONFIG_FILE" ]] || exit 0
-  load_config
-  if [[ $ROLE == exit ]]; then
-    nft delete table inet iranlink_exit_filter 2>/dev/null || true
-    nft delete table ip iranlink_exit_nat 2>/dev/null || true
-    ip link del "$WG_IF" 2>/dev/null || true
-  else
-    nft delete table inet iranlink_iran_filter 2>/dev/null || true
-    nft delete table ip iranlink_iran_nat 2>/dev/null || true
-    ip netns del "$NETNS_NAME" 2>/dev/null || true
-    ip link del "$VETH_HOST" 2>/dev/null || true
-    ip link del "$WG_IF" 2>/dev/null || true
-  fi
-}
+def api_call(url, token=None, method="GET", payload=None, timeout=5):
+    headers = {"User-Agent": f"IranLink/{VERSION}"}
+    body = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
 
-up_exit() {
-  internal_down || true
-  ip link add "$WG_IF" type wireguard
-  ip address add "$WG_EXIT_ADDR" dev "$WG_IF"
-  ip link set mtu "$MTU" dev "$WG_IF"
-  wg set "$WG_IF" private-key "$PRIVATE_KEY_FILE" listen-port "$WG_PORT"
-  [[ -s "$PEER_KEY_FILE" ]] && wg set "$WG_IF" peer "$(cat "$PEER_KEY_FILE")" allowed-ips "$WG_IRAN_IP/32"
-  ip link set up dev "$WG_IF"
-  nft_load_host render_exit_nft
-}
 
-up_iran() {
-  internal_down || true
-  [[ -s "$PEER_KEY_FILE" ]] || die "کلید سرور خارج پیدا نشد."
-  ip netns add "$NETNS_NAME"
-  ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
-  ip link set "$VETH_NS" netns "$NETNS_NAME"
-  ip address add "$VETH_HOST_ADDR" dev "$VETH_HOST"
-  ip link set up dev "$VETH_HOST"
-  ip netns exec "$NETNS_NAME" ip link set lo up
-  ip netns exec "$NETNS_NAME" ip address add "$VETH_NS_ADDR" dev "$VETH_NS"
-  ip netns exec "$NETNS_NAME" ip link set up dev "$VETH_NS"
+def sync_node_ports(node_id):
+    with db() as conn:
+        node = conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if not node or not node["registered"] or not node["agent_token"]:
+            return False, "نود هنوز ثبت نشده است"
+        rows = conn.execute(
+            "SELECT protocol,target_port FROM ports WHERE node_id=? AND enabled=1", (node_id,)
+        ).fetchall()
+    payload = {"tcp": [], "udp": []}
+    for row in rows:
+        payload[row["protocol"]].append(row["target_port"])
+    try:
+        result = api_call(
+            f"http://{node['tunnel_ip']}:{AGENT_PORT}/agent/apply",
+            token=node["agent_token"],
+            method="POST",
+            payload=payload,
+            timeout=6,
+        )
+        return bool(result.get("ok")), result.get("message", "")
+    except Exception as exc:
+        return False, str(exc)
 
-  ip link add "$WG_IF" type wireguard
-  ip link set "$WG_IF" netns "$NETNS_NAME"
-  ip netns exec "$NETNS_NAME" ip address add "$WG_IRAN_ADDR" dev "$WG_IF"
-  ip netns exec "$NETNS_NAME" ip link set mtu "$MTU" dev "$WG_IF"
-  ip netns exec "$NETNS_NAME" wg set "$WG_IF" private-key "$PRIVATE_KEY_FILE" peer "$(cat "$PEER_KEY_FILE")" endpoint "$EXIT_IP:$WG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
-  ip netns exec "$NETNS_NAME" ip link set up dev "$WG_IF"
-  ip netns exec "$NETNS_NAME" ip route add default dev "$WG_IF"
-  ip netns exec "$NETNS_NAME" ip route add default via 10.203.0.1 dev "$VETH_NS" table 100
-  ip netns exec "$NETNS_NAME" ip rule add fwmark 0x1 lookup 100 priority 100
 
-  install -d -m 755 "/etc/netns/$NETNS_NAME"
-  printf 'nameserver %s\noptions timeout:2 attempts:2\n' "$DNS_SERVER" > "/etc/netns/$NETNS_NAME/resolv.conf"
-  cp "/etc/netns/$NETNS_NAME/resolv.conf" "$CONFIG_DIR/resolv.conf"
-  ip netns exec "$NETNS_NAME" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 || true
-  ip netns exec "$NETNS_NAME" sysctl -qw net.ipv6.conf.default.disable_ipv6=1 || true
-  nft_load_ns render_iran_ns_nft
-  nft_load_host render_iran_host_nft
-}
+def sync_all_ports():
+    with db() as conn:
+        ids = [r[0] for r in conn.execute("SELECT id FROM nodes WHERE registered=1 AND enabled=1")]
+    for node_id in ids:
+        sync_node_ports(node_id)
 
-internal_up() {
-  load_config
-  case "$ROLE" in
-    exit) up_exit ;;
-    iran) up_iran ;;
-    *) die "نقش سرور نامعتبر است." ;;
-  esac
-}
 
-usage() {
-  cat <<'HELP'
-IranLink commands:
-  iranlink status
-  iranlink show-key
-  iranlink peer add PUBLIC_KEY       # روی سرور خارج
-  iranlink test
-  iranlink service attach xray.service
-  iranlink service detach xray.service
-  iranlink publish tcp 443           # روی سرور ایران
-  iranlink publish udp 443
-  iranlink unpublish tcp 443
-  iranlink ports
-  iranlink exec -- curl -4 ifconfig.me
-  iranlink mtu 1380
-  iranlink restart
-  iranlink logs
-  iranlink uninstall
-HELP
-}
+def node_status(node):
+    if not node["registered"]:
+        return "در انتظار نصب", False
+    try:
+        result = api_call(
+            f"http://{node['tunnel_ip']}:{AGENT_PORT}/agent/status",
+            token=node["agent_token"],
+            timeout=2,
+        )
+        if result.get("ok"):
+            with db() as conn:
+                conn.execute("UPDATE nodes SET last_seen=? WHERE id=?", (int(time.time()), node["id"]))
+            return "متصل", True
+    except Exception:
+        pass
+    return "قطع", False
 
-status_cmd() {
-  load_config
-  echo "version: $VERSION"
-  echo "role: $ROLE"
-  echo "wan: $WAN_IF"
-  echo "mtu: $MTU"
-  systemctl --no-pager --full status iranlink.service || true
-  echo
-  if [[ $ROLE == exit ]]; then wg show "$WG_IF" 2>/dev/null || true; else ip netns exec "$NETNS_NAME" wg show "$WG_IF" 2>/dev/null || true; fi
-}
-show_key_cmd() { [[ -s "$PUBLIC_KEY_FILE" ]] || die "کلید پیدا نشد."; cat "$PUBLIC_KEY_FILE"; }
-peer_add_cmd() {
-  load_config; [[ $ROLE == exit ]] || die "این دستور فقط روی سرور خارج اجرا می‌شود."
-  validate_wg_key "${1:-}" || die "Public Key نامعتبر است."
-  printf '%s\n' "$1" > "$PEER_KEY_FILE"; chmod 600 "$PEER_KEY_FILE"; restart_service; log "کلید ایران ثبت شد."
-}
-parse_mapping() {
-  local m=$1
-  if [[ $m == *:* ]]; then HOST_PORT=${m%%:*}; TARGET_PORT=${m##*:}; else HOST_PORT=$m; TARGET_PORT=$m; fi
-  validate_port "$HOST_PORT" || die "پورت ورودی نامعتبر است."
-  validate_port "$TARGET_PORT" || die "پورت مقصد نامعتبر است."
-}
-publish_cmd() {
-  load_config; [[ $ROLE == iran ]] || die "این دستور فقط روی سرور ایران اجرا می‌شود."
-  local proto=${1:-} m=${2:-}; [[ $proto == tcp || $proto == udp ]] || die "tcp یا udp را وارد کن."; [[ -n $m ]] || die "پورت را وارد کن."
-  parse_mapping "$m"; touch "$PORTS_FILE"; chmod 600 "$PORTS_FILE"
-  grep -Eq "^$proto[[:space:]]+$HOST_PORT[[:space:]]+$TARGET_PORT$" "$PORTS_FILE" && { warn "این پورت قبلاً ثبت شده."; return; }
-  echo "$proto $HOST_PORT $TARGET_PORT" >> "$PORTS_FILE"; ufw_add_publish "$proto" "$HOST_PORT" "$TARGET_PORT" "$WAN_IF"; restart_service; log "پورت منتشر شد."
-}
-unpublish_cmd() {
-  load_config; [[ $ROLE == iran ]] || die "این دستور فقط روی سرور ایران اجرا می‌شود."
-  local proto=${1:-} m=${2:-}; [[ $proto == tcp || $proto == udp ]] || die "tcp یا udp را وارد کن."; parse_mapping "$m"
-  [[ -f "$PORTS_FILE" ]] || return 0
-  local t remove_input=1 remove_route=1; t=$(mktemp)
-  awk -v p="$proto" -v h="$HOST_PORT" -v x="$TARGET_PORT" '!( $1==p && $2==h && $3==x )' "$PORTS_FILE" > "$t"; install -m 600 "$t" "$PORTS_FILE"; rm -f "$t"
-  grep -Eq "^$proto[[:space:]]+$HOST_PORT[[:space:]]+" "$PORTS_FILE" && remove_input=0
-  awk -v p="$proto" -v x="$TARGET_PORT" '$1==p && $3==x {f=1} END{exit !f}' "$PORTS_FILE" && remove_route=0
-  ufw_remove_publish "$proto" "$HOST_PORT" "$TARGET_PORT" "$WAN_IF" "$remove_input" "$remove_route"; restart_service; log "پورت حذف شد."
-}
-ports_cmd() { load_config; [[ -s "$PORTS_FILE" ]] && cat "$PORTS_FILE" || echo "هیچ پورتی ثبت نشده است."; }
-exec_cmd() { load_config; [[ $ROLE == iran ]] || die "فقط روی سرور ایران."; [[ ${1:-} == -- ]] && shift; (($#)) || die "فرمان وارد نشده."; ip netns exec "$NETNS_NAME" "$@"; }
-service_attach_cmd() {
-  load_config; [[ $ROLE == iran ]] || die "فقط روی سرور ایران."
-  local unit=${1:-}; [[ $unit =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "نام سرویس باید با .service تمام شود."
-  systemctl cat "$unit" >/dev/null 2>&1 || die "سرویس پیدا نشد: $unit"
-  local d="/etc/systemd/system/${unit}.d"; install -d -m 755 "$d"
-  cat > "$d/90-iranlink.conf" <<EOF
-[Unit]
-Requires=iranlink.service
-BindsTo=iranlink.service
-After=iranlink.service
-[Service]
-PrivateNetwork=false
-NetworkNamespacePath=/run/netns/$NETNS_NAME
-BindReadOnlyPaths=$CONFIG_DIR/resolv.conf:/etc/resolv.conf
-EOF
-  systemctl daemon-reload
-  if ! systemctl restart "$unit"; then rm -f "$d/90-iranlink.conf"; systemctl daemon-reload; die "اتصال سرویس ناموفق بود."; fi
-  touch "$SERVICES_FILE"; chmod 600 "$SERVICES_FILE"; grep -Fxq "$unit" "$SERVICES_FILE" || echo "$unit" >> "$SERVICES_FILE"; log "$unit به تونل وصل شد."
-}
-service_detach_cmd() {
-  local unit=${1:-}; [[ $unit =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "نام سرویس نامعتبر است."
-  rm -f "/etc/systemd/system/${unit}.d/90-iranlink.conf"; rmdir "/etc/systemd/system/${unit}.d" 2>/dev/null || true; systemctl daemon-reload; systemctl restart "$unit"
-  if [[ -f "$SERVICES_FILE" ]]; then local t; t=$(mktemp); grep -Fvx "$unit" "$SERVICES_FILE" > "$t" || true; install -m 600 "$t" "$SERVICES_FILE"; rm -f "$t"; fi
-  log "$unit از تونل جدا شد."
-}
-mtu_cmd() { load_config; local x=${1:-}; [[ $x =~ ^[0-9]+$ ]] && ((x>=1280 && x<=1420)) || die "MTU باید 1280 تا 1420 باشد."; sed -i -E "s/^MTU=.*/MTU=$x/" "$CONFIG_FILE"; restart_service; }
-test_cmd() {
-  load_config
-  if [[ $ROLE == exit ]]; then
-    [[ -n $(wg show "$WG_IF" peers 2>/dev/null) ]] || die "هنوز کلید ایران ثبت نشده است."
-    wg show "$WG_IF"; echo "EXIT OK"
-  else
-    local hs host_ip out_ip
-    hs=$(ip netns exec "$NETNS_NAME" wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{m=0}{if($2>m)m=$2}END{print m}')
-    [[ ${hs:-0} -gt 0 ]] || die "Handshake برقرار نیست؛ کلید ایران را روی خارج ثبت کن و UDP را باز نگه دار."
-    host_ip=$(detect_public_ipv4 || true)
-    out_ip=$(ip netns exec "$NETNS_NAME" curl -4fsS --max-time 10 https://api.ipify.org || true)
-    [[ -n $out_ip ]] || die "اینترنت داخل تونل برقرار نیست."
-    echo "IP ایران: ${host_ip:-unknown}"
-    echo "IP خروجی تونل: $out_ip"
-    [[ -z $host_ip || $host_ip != "$out_ip" ]] || die "نشت IP تشخیص داده شد."
-    echo "LEAK TEST: OK"
-  fi
-}
-uninstall_cmd() {
-  ufw_cleanup
-  local units=() u
-  [[ -s "$SERVICES_FILE" ]] && mapfile -t units < "$SERVICES_FILE"
-  for u in "${units[@]}"; do rm -f "/etc/systemd/system/${u}.d/90-iranlink.conf"; rmdir "/etc/systemd/system/${u}.d" 2>/dev/null || true; done
-  systemctl disable --now iranlink.service 2>/dev/null || true; internal_down 2>/dev/null || true
-  rm -f "$SERVICE_FILE" "$BIN_PATH" /etc/sysctl.d/99-iranlink.conf /etc/sysctl.d/99-iranlink-bbr.conf
-  rm -rf "$CONFIG_DIR" "/etc/netns/$NETNS_NAME"
-  systemctl daemon-reload; sysctl --system >/dev/null 2>&1 || true
-  for u in "${units[@]}"; do systemctl restart "$u" 2>/dev/null || true; done
-  log "IranLink حذف شد."
-}
 
-require_root
-case ${1:-} in
-  internal-up) internal_up ;;
-  internal-down) internal_down ;;
-  status) status_cmd ;;
-  show-key) show_key_cmd ;;
-  peer) [[ ${2:-} == add ]] || die "iranlink peer add PUBLIC_KEY"; peer_add_cmd "${3:-}" ;;
-  test) test_cmd ;;
-  publish) publish_cmd "${2:-}" "${3:-}" ;;
-  unpublish) unpublish_cmd "${2:-}" "${3:-}" ;;
-  ports) ports_cmd ;;
-  exec) shift; exec_cmd "$@" ;;
-  service)
-    case ${2:-} in
-      attach) service_attach_cmd "${3:-}" ;;
-      detach) service_detach_cmd "${3:-}" ;;
-      *) die "iranlink service attach|detach UNIT.service" ;;
-    esac
-    ;;
-  mtu) mtu_cmd "${2:-}" ;;
-  restart) restart_service ;;
-  logs) journalctl -u iranlink.service -n 100 --no-pager ;;
-  uninstall) uninstall_cmd ;;
-  help|-h|--help|"") usage ;;
-  *) usage; exit 1 ;;
-esac
+def create_panel_app():
+    app = Flask(__name__)
+    settings = panel_settings()
+    app.secret_key = settings["session_secret"]
+    app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+
+    def csrf_token():
+        token = session.get("csrf")
+        if not token:
+            token = secrets.token_urlsafe(24)
+            session["csrf"] = token
+        return token
+
+    app.jinja_env.globals["csrf_token"] = csrf_token
+
+    def login_required(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not session.get("logged_in"):
+                return redirect(url_for("login"))
+            return fn(*args, **kwargs)
+        return wrapper
+
+    @app.before_request
+    def csrf_guard():
+        if request.method == "POST" and request.endpoint not in {"bootstrap_complete", "agent_apply"}:
+            if not hmac.compare_digest(request.form.get("csrf", ""), session.get("csrf", "!")):
+                abort(400, "CSRF نامعتبر")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            if check_password_hash(settings["admin_password_hash"], request.form.get("password", "")):
+                session.clear()
+                session["logged_in"] = True
+                csrf_token()
+                return redirect(url_for("dashboard"))
+            flash("رمز اشتباه است", "danger")
+        return render_page("ورود", LOGIN_BODY, logged_in=False)
+
+    @app.route("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
+
+    @app.route("/")
+    @login_required
+    def dashboard():
+        with db() as conn:
+            nodes = conn.execute("SELECT * FROM nodes ORDER BY id DESC").fetchall()
+            ports = conn.execute(
+                "SELECT p.*,n.name AS node_name FROM ports p JOIN nodes n ON n.id=p.node_id ORDER BY p.id DESC"
+            ).fetchall()
+        enriched = []
+        statuses = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(nodes)))) as pool:
+            future_map = {pool.submit(node_status, n): n["id"] for n in nodes}
+            for future, node_id in future_map.items():
+                try:
+                    statuses[node_id] = future.result(timeout=3)
+                except Exception:
+                    statuses[node_id] = ("قطع", False)
+        for n in nodes:
+            status, online = statuses.get(n["id"], ("قطع", False))
+            command = (
+                f"curl -fsSL https://raw.githubusercontent.com/golb4212-design/iranlink/main/install.sh "
+                f"| sudo bash -s -- foreign --panel-url http://{settings['public_ip']}:{settings['panel_port']} "
+                f"--bootstrap {n['bootstrap_token']}"
+            )
+            enriched.append({**dict(n), "status_text": status, "online": online, "command": command})
+        return render_page(
+            "مدیریت تونل پاسارگارد",
+            DASHBOARD_BODY,
+            nodes=enriched,
+            ports=ports,
+            settings=settings,
+            public_key=PUBLIC_KEY.read_text().strip(),
+        )
+
+    @app.route("/nodes/add", methods=["POST"])
+    @login_required
+    def add_node():
+        name = request.form.get("name", "").strip()[:80]
+        endpoint_ip = valid_ip(request.form.get("endpoint_ip", "").strip())
+        endpoint_port = 51820
+        if not name or not endpoint_ip:
+            flash("نام و IP نود خارج را درست وارد کن", "danger")
+            return redirect(url_for("dashboard"))
+        with db() as conn:
+            tunnel_ip = allocate_tunnel_ip(conn)
+            token = secrets.token_urlsafe(28)
+            conn.execute(
+                "INSERT INTO nodes(name,endpoint_ip,endpoint_port,tunnel_ip,bootstrap_token,created_at) VALUES(?,?,?,?,?,?)",
+                (name, endpoint_ip, endpoint_port, tunnel_ip, token, int(time.time())),
+            )
+        flash("نود ساخته شد؛ دستور نصب نود را اجرا کن", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/nodes/<int:node_id>/edit", methods=["POST"])
+    @login_required
+    def edit_node(node_id):
+        name = request.form.get("name", "").strip()[:80]
+        endpoint_ip = valid_ip(request.form.get("endpoint_ip", "").strip())
+        if not name or not endpoint_ip:
+            flash("اطلاعات نود نامعتبر است", "danger")
+            return redirect(url_for("dashboard"))
+        with db() as conn:
+            conn.execute(
+                "UPDATE nodes SET name=?,endpoint_ip=? WHERE id=?",
+                (name, endpoint_ip, node_id),
+            )
+        sync_wg()
+        flash("اطلاعات نود و IP خارج بروزرسانی شد", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/nodes/<int:node_id>/delete", methods=["POST"])
+    @login_required
+    def delete_node(node_id):
+        with db() as conn:
+            conn.execute("DELETE FROM nodes WHERE id=?", (node_id,))
+        sync_wg()
+        apply_panel_rules()
+        flash("نود حذف شد", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/nodes/<int:node_id>/sync", methods=["POST"])
+    @login_required
+    def sync_node(node_id):
+        ok, message = sync_node_ports(node_id)
+        flash("پورت‌ها با نود هماهنگ شدند" if ok else f"هماهنگ‌سازی ناموفق: {message}", "success" if ok else "danger")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/ports/add", methods=["POST"])
+    @login_required
+    def add_port():
+        node_id = request.form.get("node_id", type=int)
+        protocol = request.form.get("protocol", "")
+        public_port = valid_port(request.form.get("public_port"))
+        target_port = valid_port(request.form.get("target_port"))
+        if protocol not in {"tcp", "udp", "both"} or not node_id or not public_port or not target_port:
+            flash("اطلاعات پورت نامعتبر است", "danger")
+            return redirect(url_for("dashboard"))
+        protocols = ["tcp", "udp"] if protocol == "both" else [protocol]
+        try:
+            with db() as conn:
+                node = conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+                if not node:
+                    raise ValueError("نود پیدا نشد")
+                for proto in protocols:
+                    conn.execute(
+                        "INSERT INTO ports(node_id,protocol,public_port,target_port,created_at) VALUES(?,?,?,?,?)",
+                        (node_id, proto, public_port, target_port, int(time.time())),
+                    )
+        except sqlite3.IntegrityError:
+            flash("این پورت ورودی برای همین پروتکل قبلاً استفاده شده", "danger")
+            return redirect(url_for("dashboard"))
+        apply_panel_rules()
+        ok, message = sync_node_ports(node_id)
+        flash("پورت اضافه شد" + (" و روی نود فعال شد" if ok else f"؛ نود فعلاً پاسخ نداد: {message}"), "success" if ok else "warning")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/ports/<int:port_id>/delete", methods=["POST"])
+    @login_required
+    def delete_port(port_id):
+        with db() as conn:
+            row = conn.execute("SELECT node_id FROM ports WHERE id=?", (port_id,)).fetchone()
+            if row:
+                node_id = row["node_id"]
+                conn.execute("DELETE FROM ports WHERE id=?", (port_id,))
+            else:
+                node_id = None
+        apply_panel_rules()
+        if node_id:
+            sync_node_ports(node_id)
+        flash("پورت حذف شد", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/settings", methods=["POST"])
+    @login_required
+    def update_settings():
+        mtu = request.form.get("mtu", type=int)
+        if not mtu or not 1280 <= mtu <= 1420:
+            flash("MTU نامعتبر است", "danger")
+            return redirect(url_for("dashboard"))
+        settings["mtu"] = mtu
+        save_json(SETTINGS_PATH, settings)
+        render_panel_wg()
+        run(["systemctl", "restart", f"wg-quick@{WG_IF}.service"], check=False)
+        apply_panel_rules()
+        flash("MTU ذخیره شد", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/api/bootstrap/<token>")
+    def bootstrap_info(token):
+        with db() as conn:
+            node = conn.execute("SELECT * FROM nodes WHERE bootstrap_token=?", (token,)).fetchone()
+        if not node or node["registered"]:
+            return jsonify(ok=False, message="کد نصب نامعتبر یا استفاده‌شده است"), 404
+        return jsonify(
+            ok=True,
+            iran_ip=settings["public_ip"],
+            iran_wg_port=settings["wg_port"],
+            panel_public_key=PUBLIC_KEY.read_text().strip(),
+            tunnel_ip=node["tunnel_ip"],
+            foreign_wg_port=node["endpoint_port"],
+            mtu=settings["mtu"],
+            agent_port=AGENT_PORT,
+        )
+
+    @app.route("/api/bootstrap/<token>/complete", methods=["POST"])
+    def bootstrap_complete(token):
+        data = request.get_json(silent=True) or {}
+        public_key = data.get("public_key", "")
+        agent_token = data.get("agent_token", "")
+        endpoint_ip = valid_ip(data.get("endpoint_ip", ""))
+        if not valid_wg_key(public_key) or len(agent_token) < 32 or not endpoint_ip:
+            return jsonify(ok=False, message="اطلاعات ثبت نود نامعتبر است"), 400
+        with db() as conn:
+            node = conn.execute("SELECT * FROM nodes WHERE bootstrap_token=?", (token,)).fetchone()
+            if not node or node["registered"]:
+                return jsonify(ok=False, message="کد نصب نامعتبر یا استفاده‌شده است"), 404
+            conn.execute(
+                "UPDATE nodes SET public_key=?,agent_token=?,endpoint_ip=?,registered=1,last_seen=? WHERE id=?",
+                (public_key, agent_token, endpoint_ip, int(time.time()), node["id"]),
+            )
+        sync_wg()
+        apply_panel_rules()
+        return jsonify(ok=True, message="نود با موفقیت ثبت شد")
+
+    return app
+
+
+def auth_agent():
+    settings = agent_settings()
+    header = request.headers.get("Authorization", "")
+    expected = f"Bearer {settings['agent_token']}"
+    if not hmac.compare_digest(header, expected):
+        abort(401)
+    return settings
+
+
+def create_agent_app():
+    app = Flask(__name__)
+
+    @app.get("/agent/status")
+    def agent_status():
+        settings = auth_agent()
+        handshake = 0
+        r = run(["wg", "show", WG_IF, "latest-handshakes"], check=False)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                handshake = max(handshake, int(parts[1]))
+        return jsonify(
+            ok=True,
+            version=VERSION,
+            tunnel_ip=settings["tunnel_ip"],
+            handshake=handshake,
+            ports=load_json(PORTS_CACHE, {"tcp": [], "udp": []}),
+        )
+
+    @app.post("/agent/apply")
+    def agent_apply():
+        auth_agent()
+        data = request.get_json(silent=True) or {}
+        apply_agent_rules(data)
+        return jsonify(ok=True, message="پورت‌ها اعمال شدند")
+
+    return app
+
+
+BASE_HTML = r"""
+<!doctype html><html lang="fa" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} | IranLink</title>
+<style>
+:root{--bg:#09111f;--card:#111d31;--muted:#91a4be;--text:#eef5ff;--blue:#4a8dff;--green:#2ed39b;--red:#ff657a;--yellow:#f2bd55;--border:#21324c}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#07101d,#0c1728);color:var(--text);font-family:Tahoma,Arial,sans-serif;min-height:100vh}.wrap{max-width:1180px;margin:auto;padding:22px}.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.brand{font-weight:800;font-size:22px}.sub{color:var(--muted);font-size:13px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:15px}.card{grid-column:span 12;background:rgba(17,29,49,.96);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 12px 35px #0003}.half{grid-column:span 6}.third{grid-column:span 4}@media(max-width:850px){.half,.third{grid-column:span 12}.top{align-items:flex-start;flex-direction:column}}h1,h2,h3{margin:0 0 12px}h2{font-size:18px}p{line-height:1.8}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{flex:1;min-width:145px}label{display:block;color:var(--muted);font-size:13px;margin-bottom:7px}input,select{width:100%;border:1px solid var(--border);border-radius:12px;background:#0b1525;color:var(--text);padding:12px;outline:none}input:focus,select:focus{border-color:var(--blue)}button,.btn{border:0;border-radius:12px;padding:11px 15px;color:white;background:var(--blue);cursor:pointer;text-decoration:none;display:inline-block;font-weight:700}.danger{background:var(--red)}.ghost{background:#263751}.green{background:var(--green);color:#06140f}.tag{display:inline-flex;border-radius:999px;padding:5px 9px;font-size:12px;background:#24344d;color:#c9d8ec}.online{background:#123b30;color:#70efc3}.offline{background:#442433;color:#ff9aab}.warning{background:#4b3a17;color:#ffd37a}.table{width:100%;border-collapse:collapse}.table th,.table td{text-align:right;padding:11px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:top}.table th{color:var(--muted)}.code{direction:ltr;text-align:left;background:#07101d;border:1px solid var(--border);padding:12px;border-radius:12px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-family:monospace;font-size:12px}.flash{padding:12px 14px;border-radius:12px;margin-bottom:12px;background:#17355d}.flash.danger{background:#522434}.flash.warning{background:#4b3a17}.stat{font-size:26px;font-weight:800}.muted{color:var(--muted)}.actions{display:flex;gap:7px;flex-wrap:wrap}.small{padding:8px 10px;font-size:12px}.login{max-width:420px;margin:12vh auto}.sep{height:1px;background:var(--border);margin:15px 0}.ltr{direction:ltr;text-align:left}
+</style></head><body><div class="wrap">
+<div class="top"><div><div class="brand">IranLink • Pasargad Nodes</div><div class="sub">مدیریت IP ایران، نودهای خارج و پورت‌ها</div></div>{% if logged_in %}<a class="btn ghost" href="{{ url_for('logout') }}">خروج</a>{% endif %}</div>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+{{ body|safe }}
+</div></body></html>
+"""
+
+LOGIN_BODY = r"""
+<div class="card login"><h2>ورود به پنل</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><div class="field"><label>رمز مدیریت</label><input type="password" name="password" autofocus required></div><br><button style="width:100%">ورود</button></form></div>
+"""
+
+DASHBOARD_BODY = r"""
+<div class="grid">
+<div class="card third"><div class="muted">IP قابل استفاده در کانفیگ‌ها</div><div class="stat ltr">{{ settings.public_ip }}</div></div>
+<div class="card third"><div class="muted">تعداد نودها</div><div class="stat">{{ nodes|length }}</div></div>
+<div class="card third"><div class="muted">تعداد نگاشت پورت</div><div class="stat">{{ ports|length }}</div></div>
+
+<div class="card half"><h2>افزودن نود خارج</h2><p class="muted">برای هر نود پاسارگارد یک‌بار اضافه کن؛ بعد دستور نصب آماده نمایش داده می‌شود.</p><form method="post" action="{{ url_for('add_node') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><div class="row"><div class="field"><label>نام نود</label><input name="name" placeholder="Germany-1" required></div><div class="field"><label>IP سرور خارج</label><input class="ltr" name="endpoint_ip" placeholder="1.2.3.4" required></div><button>ساخت نود</button></div></form></div>
+
+<div class="card half"><h2>افزودن پورت پاسارگارد</h2><form method="post" action="{{ url_for('add_port') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><div class="row"><div class="field"><label>نود مقصد</label><select name="node_id" required><option value="">انتخاب</option>{% for n in nodes %}<option value="{{ n.id }}">{{ n.name }} — {{ n.tunnel_ip }}</option>{% endfor %}</select></div><div class="field"><label>نوع</label><select name="protocol"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select></div><div class="field"><label>پورت روی IP ایران</label><input name="public_port" placeholder="443" required></div><div class="field"><label>پورت نود خارج</label><input name="target_port" placeholder="443" required></div><button class="green">افزودن</button></div></form></div>
+
+<div class="card"><h2>نودهای خارج</h2>{% if nodes %}<div style="overflow:auto"><table class="table"><tr><th>نود</th><th>وضعیت</th><th>IP خارج</th><th>IP تونل</th><th>دستور نصب</th><th>عملیات</th></tr>{% for n in nodes %}<tr><td><b>{{ n.name }}</b></td><td><span class="tag {{ 'online' if n.online else ('warning' if not n.registered else 'offline') }}">{{ n.status_text }}</span></td><td class="ltr">{{ n.endpoint_ip }}:{{ n.endpoint_port }}</td><td class="ltr">{{ n.tunnel_ip }}</td><td>{% if not n.registered %}<div class="code">{{ n.command }}</div>{% else %}<span class="tag online">نصب شده</span>{% endif %}</td><td><div class="actions"><form method="post" action="{{ url_for('sync_node',node_id=n.id) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="small ghost">همگام‌سازی</button></form><details><summary class="btn small ghost">ویرایش IP</summary><form method="post" action="{{ url_for('edit_node',node_id=n.id) }}" style="margin-top:8px;min-width:250px"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input name="name" value="{{ n.name }}"><br><br><input class="ltr" name="endpoint_ip" value="{{ n.endpoint_ip }}"><br><br><button class="small">ذخیره</button></form></details><form method="post" action="{{ url_for('delete_node',node_id=n.id) }}" onsubmit="return confirm('نود حذف شود؟')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="small danger">حذف</button></form></div></td></tr>{% endfor %}</table></div>{% else %}<p class="muted">هنوز نودی ساخته نشده.</p>{% endif %}</div>
+
+<div class="card"><h2>پورت‌های فعال</h2>{% if ports %}<div style="overflow:auto"><table class="table"><tr><th>IP ایران</th><th>پروتکل</th><th>پورت ایران</th><th>نود خارج</th><th>پورت مقصد</th><th></th></tr>{% for p in ports %}<tr><td class="ltr">{{ settings.public_ip }}</td><td><span class="tag">{{ p.protocol|upper }}</span></td><td>{{ p.public_port }}</td><td>{{ p.node_name }}</td><td>{{ p.target_port }}</td><td><form method="post" action="{{ url_for('delete_port',port_id=p.id) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="small danger">حذف</button></form></td></tr>{% endfor %}</table></div>{% else %}<p class="muted">هیچ پورتی تعریف نشده.</p>{% endif %}</div>
+
+<div class="card half"><h2>تنظیمات تونل</h2><form method="post" action="{{ url_for('update_settings') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><div class="row"><div class="field"><label>IP عمومی ایران</label><input class="ltr" value="{{ settings.public_ip }}" readonly></div><div class="field"><label>MTU</label><input name="mtu" value="{{ settings.mtu }}"></div><button>ذخیره MTU</button></div></form></div>
+<div class="card half"><h2>اطلاعات تونل ایران</h2><div class="muted">WireGuard Public Key</div><div class="code">{{ public_key }}</div><p class="muted">در کانفیگ پاسارگارد فقط IP ایران و پورتی که اینجا تعریف کرده‌ای قرار می‌گیرد. SNI/Host و تنظیمات پروتکل نود تغییر نمی‌کند.</p></div>
+</div>
+"""
+
+
+def render_page(title, body_template, logged_in=True, **ctx):
+    body = render_template_string(body_template, **ctx)
+    return render_template_string(BASE_HTML, title=title, body=body, logged_in=logged_in)
+
+
+def init_panel(args):
+    BASE.mkdir(parents=True, exist_ok=True)
+    ensure_keys()
+    wan = detect_wan_if()
+    public_ip = valid_ip(args.public_ip) or detect_public_ip()
+    if not public_ip:
+        raise SystemExit("IP عمومی ایران تشخیص داده نشد")
+    settings = {
+        "role": "iran",
+        "public_ip": public_ip,
+        "wan_if": wan,
+        "wg_port": args.wg_port,
+        "panel_port": args.panel_port,
+        "mtu": args.mtu,
+        "admin_password_hash": generate_password_hash(args.admin_password),
+        "session_secret": secrets.token_hex(32),
+    }
+    save_json(SETTINGS_PATH, settings)
+    init_db()
+    render_panel_wg()
+    print(json.dumps({"ok": True, "public_ip": public_ip, "public_key": PUBLIC_KEY.read_text().strip()}, ensure_ascii=False))
+
+
+def init_agent(args):
+    ensure_keys()
+    info = api_call(f"{args.panel_url.rstrip('/')}/api/bootstrap/{args.bootstrap}", timeout=12)
+    if not info.get("ok"):
+        raise SystemExit(info.get("message", "کد نصب نامعتبر است"))
+    public_ip = detect_public_ip()
+    if not public_ip:
+        raise SystemExit("IP عمومی سرور خارج تشخیص داده نشد")
+    token = secrets.token_urlsafe(40)
+    data = {
+        "role": "foreign",
+        "panel_url": args.panel_url.rstrip("/"),
+        "bootstrap": args.bootstrap,
+        "iran_ip": info["iran_ip"],
+        "iran_wg_port": int(info["iran_wg_port"]),
+        "panel_public_key": info["panel_public_key"],
+        "tunnel_ip": info["tunnel_ip"],
+        "foreign_wg_port": int(info["foreign_wg_port"]),
+        "mtu": int(info["mtu"]),
+        "agent_token": token,
+        "agent_port": AGENT_PORT,
+        "wan_if": detect_wan_if(),
+        "public_ip": public_ip,
+    }
+    save_json(AGENT_PATH, data)
+    save_json(PORTS_CACHE, {"tcp": [], "udp": []})
+    render_agent_wg(data)
+    payload = {
+        "public_key": PUBLIC_KEY.read_text().strip(),
+        "agent_token": token,
+        "endpoint_ip": public_ip,
+    }
+    result = api_call(
+        f"{args.panel_url.rstrip('/')}/api/bootstrap/{args.bootstrap}/complete",
+        method="POST",
+        payload=payload,
+        timeout=15,
+    )
+    if not result.get("ok"):
+        raise SystemExit(result.get("message", "ثبت نود ناموفق بود"))
+    print(json.dumps({"ok": True, "tunnel_ip": data["tunnel_ip"], "public_ip": public_ip}, ensure_ascii=False))
+
+
+def cli():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init-panel")
+    p.add_argument("--public-ip", default="")
+    p.add_argument("--wg-port", type=int, default=51820)
+    p.add_argument("--panel-port", type=int, default=8088)
+    p.add_argument("--mtu", type=int, default=1380)
+    p.add_argument("--admin-password", required=True)
+    a = sub.add_parser("init-agent")
+    a.add_argument("--panel-url", required=True)
+    a.add_argument("--bootstrap", required=True)
+    sub.add_parser("apply-panel")
+    sub.add_parser("apply-agent")
+    args = parser.parse_args()
+    if args.cmd == "init-panel":
+        init_panel(args)
+    elif args.cmd == "init-agent":
+        init_agent(args)
+    elif args.cmd == "apply-panel":
+        init_db(); apply_panel_rules(); sync_all_ports()
+    elif args.cmd == "apply-agent":
+        apply_agent_rules()
+
+
+MODE = os.environ.get("IRANLINK_MODE", "")
+if MODE == "panel":
+    app = create_panel_app()
+elif MODE == "agent":
+    app = create_agent_app()
+else:
+    app = Flask(__name__)
+
+if __name__ == "__main__":
+    cli()
