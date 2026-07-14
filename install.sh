@@ -81,7 +81,8 @@ EOF
 if modprobe tcp_bbr 2>/dev/null && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
   echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/99-iranlink.conf
 fi
-sysctl --system >/dev/null
+# فقط تنظیمات خود IranLink اعمال می‌شود؛ خطاهای فایل‌های قدیمی سیستم نصب را متوقف نمی‌کنند.
+sysctl -p /etc/sysctl.d/99-iranlink.conf >/dev/null 2>&1 || true
 
 if [[ "$ROLE" == "iran" ]]; then
   if [[ -z "$ADMIN_PASSWORD" ]]; then
